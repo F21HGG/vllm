@@ -707,6 +707,9 @@ class GPUModelRunner(
 
         self.num_spec_tokens = 0
         self.prev_num_spec_tokens = 0
+        self._gdn_exact_state_committers: tuple[
+            Callable[[torch.Tensor], None], ...
+        ] = ()
         self.valid_sampled_token_count_gpu: torch.Tensor | None = None
         if self.speculative_config:
             self.num_spec_tokens = self.speculative_config.num_speculative_tokens
@@ -1580,6 +1583,10 @@ class GPUModelRunner(
         # tokens gives us the first -1 position (i.e., number of accepted).
         num_reqs = output_token_ids.size(0)
         self.num_accepted_tokens.gpu[:num_reqs] = (output_token_ids != -1).sum(dim=1)
+
+        if any(scheduler_output.scheduled_spec_decode_tokens.values()):
+            for commit in self._gdn_exact_state_committers:
+                commit(self.num_accepted_tokens.gpu[:num_reqs])
 
         if self.cache_config.mamba_cache_mode == "align":
             # Fused GPU postprocess: state copies + per-request accepted-token
@@ -5452,6 +5459,7 @@ class GPUModelRunner(
             format_gib(self.model_memory_usage),
             time_after_load - time_before_load,
         )
+        self._initialize_gdn_exact_state_committers()
 
         mm_config = self.model_config.multimodal_config
         self.is_multimodal_pruning_enabled = (
@@ -5518,6 +5526,44 @@ class GPUModelRunner(
                 )
 
         get_offloader().post_init()
+
+    def _initialize_gdn_exact_state_committers(self) -> None:
+        if not envs.VLLM_ENABLE_GDN_EXACT_SPEC_STATE_COMMIT:
+            self._gdn_exact_state_committers = ()
+            return
+
+        from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
+            QwenGatedDeltaNetAttention,
+        )
+
+        layers = tuple(
+            layer
+            for layer in self.compilation_config.static_forward_context.values()
+            if isinstance(layer, QwenGatedDeltaNetAttention)
+            and layer.use_exact_spec_state_commit
+        )
+        expected_layers = self.model_config.get_num_layers_by_block_type(
+            self.parallel_config, "linear_attention"
+        )
+        if len(layers) != expected_layers or expected_layers == 0:
+            raise RuntimeError(
+                "exact GDN state commit layer binding mismatch: "
+                f"expected={expected_layers}, found={len(layers)}"
+            )
+
+        self._gdn_exact_state_committers = tuple(
+            layer.commit_exact_spec_state for layer in layers
+        )
+        scratch_bytes = sum(
+            layer.get_exact_spec_state_scratch_bytes() for layer in layers
+        )
+        logger.info_once(
+            "Bound exact GDN state commit lifecycle: layers=%d, "
+            "scratch_bytes_per_gpu=%d (%.3f GiB)",
+            len(layers),
+            scratch_bytes,
+            scratch_bytes / (1 << 30),
+        )
 
     def _setup_eagle3_aux_hidden_state_outputs(self) -> None:
         if not self.use_aux_hidden_state_outputs:

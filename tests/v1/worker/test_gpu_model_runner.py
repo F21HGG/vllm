@@ -1648,6 +1648,129 @@ def test_is_uniform_decode() -> None:
     )
 
 
+def _make_exact_commit_runner(committers):
+    runner = Mock(spec=GPUModelRunner)
+    runner.speculative_config = Mock()
+    runner.model_config = SimpleNamespace(is_hybrid=True)
+    runner.cache_config = SimpleNamespace(mamba_cache_mode="align")
+    runner.num_accepted_tokens = SimpleNamespace(
+        cpu=Mock(), gpu=torch.zeros(5, dtype=torch.int64)
+    )
+    runner.input_batch = SimpleNamespace(num_accepted_tokens_cpu_tensor=Mock())
+    runner._get_mamba_bufs = Mock(return_value=Mock())
+    runner.kv_cache_config = Mock()
+    runner.compilation_config = SimpleNamespace(static_forward_context=Mock())
+    runner._gdn_exact_state_committers = committers
+    runner.model = SimpleNamespace(get_mamba_state_copy_func=Mock(return_value=Mock()))
+    runner.num_accepted_tokens_event = Mock()
+    return runner
+
+
+@pytest.mark.skip_global_cleanup
+def test_exact_gdn_commit_precedes_align_state_copy(monkeypatch):
+    call_order = []
+
+    def commit(counts):
+        call_order.append(("commit", counts.clone()))
+
+    def postprocess(**kwargs):
+        call_order.append(("postprocess", kwargs["num_accepted_tokens_gpu"].clone()))
+
+    monkeypatch.setattr(
+        gpu_model_runner_module.mamba_utils,
+        "postprocess_mamba_align_gpu",
+        postprocess,
+    )
+    runner = _make_exact_commit_runner((commit,))
+    scheduler_output = SimpleNamespace(
+        scheduled_spec_decode_tokens={"req": [10, 11, 12]}
+    )
+
+    GPUModelRunner._update_states_after_model_execute(
+        runner,
+        torch.tensor([[10, 11, -1], [12, -1, -1]]),
+        scheduler_output,
+    )
+
+    assert [name for name, _ in call_order] == ["commit", "postprocess"]
+    assert torch.equal(call_order[0][1], torch.tensor([2, 1]))
+
+
+@pytest.mark.parametrize(
+    "scheduled_spec_decode_tokens",
+    [{}, {"draftless": []}],
+    ids=["abort-preempt-allocation-failure", "draftless"],
+)
+@pytest.mark.skip_global_cleanup
+def test_exact_gdn_commit_skips_rows_without_scheduled_drafts(
+    monkeypatch,
+    scheduled_spec_decode_tokens,
+):
+    commit = Mock()
+    monkeypatch.setattr(
+        gpu_model_runner_module.mamba_utils,
+        "postprocess_mamba_align_gpu",
+        Mock(),
+    )
+    runner = _make_exact_commit_runner((commit,))
+    scheduler_output = SimpleNamespace(
+        scheduled_spec_decode_tokens=scheduled_spec_decode_tokens
+    )
+
+    GPUModelRunner._update_states_after_model_execute(
+        runner,
+        torch.tensor([[10, -1]]),
+        scheduler_output,
+    )
+
+    commit.assert_not_called()
+
+
+@pytest.mark.skip_global_cleanup
+def test_exact_gdn_committers_are_bound_once(monkeypatch):
+    from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
+        QwenGatedDeltaNetAttention,
+    )
+
+    monkeypatch.setattr(
+        gpu_model_runner_module.envs,
+        "VLLM_ENABLE_GDN_EXACT_SPEC_STATE_COMMIT",
+        True,
+    )
+    layer = Mock(spec=QwenGatedDeltaNetAttention)
+    layer.use_exact_spec_state_commit = True
+    layer.get_exact_spec_state_scratch_bytes.return_value = 123
+    runner = SimpleNamespace(
+        compilation_config=SimpleNamespace(static_forward_context={"gdn": layer}),
+        model_config=Mock(),
+        parallel_config=Mock(),
+    )
+    runner.model_config.get_num_layers_by_block_type.return_value = 1
+
+    GPUModelRunner._initialize_gdn_exact_state_committers(runner)
+
+    assert runner._gdn_exact_state_committers == (layer.commit_exact_spec_state,)
+    layer.get_exact_spec_state_scratch_bytes.assert_called_once_with()
+
+
+@pytest.mark.skip_global_cleanup
+def test_exact_gdn_committer_binding_fails_closed(monkeypatch):
+    monkeypatch.setattr(
+        gpu_model_runner_module.envs,
+        "VLLM_ENABLE_GDN_EXACT_SPEC_STATE_COMMIT",
+        True,
+    )
+    runner = SimpleNamespace(
+        compilation_config=SimpleNamespace(static_forward_context={}),
+        model_config=Mock(),
+        parallel_config=Mock(),
+    )
+    runner.model_config.get_num_layers_by_block_type.return_value = 1
+
+    with pytest.raises(RuntimeError, match="layer binding mismatch"):
+        GPUModelRunner._initialize_gdn_exact_state_committers(runner)
+
+
 @pytest.mark.skipif(
     not current_platform.is_cuda(),
     reason="Attention backend FLASHINFER is only supported on CUDA.",

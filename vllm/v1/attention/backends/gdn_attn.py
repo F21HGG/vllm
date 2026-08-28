@@ -7,6 +7,7 @@ from typing import Literal
 
 import torch
 
+from vllm import envs
 from vllm.config import VllmConfig
 from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.attention.backend import (
@@ -62,6 +63,7 @@ class GDNAttentionMetadata:
     spec_sequence_masks: torch.Tensor | None = None  # shape: [batch,]
     spec_token_indx: torch.Tensor | None = None
     non_spec_token_indx: torch.Tensor | None = None
+    spec_request_indices: torch.Tensor | None = None  # shape: [batch,]
 
     num_accepted_tokens: torch.Tensor | None = None  # shape: [batch,]
 
@@ -164,6 +166,14 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             dtype=torch.int32,
             device=device,
         )
+        self.use_exact_spec_state_commit = envs.VLLM_ENABLE_GDN_EXACT_SPEC_STATE_COMMIT
+        self.spec_request_indices: torch.Tensor | None = None
+        if self.use_exact_spec_state_commit:
+            self.spec_request_indices = torch.empty(
+                (self.vllm_config.scheduler_config.max_num_seqs,),
+                dtype=torch.int32,
+                device=device,
+            )
 
     def _build_chunk_metadata(
         self,
@@ -228,6 +238,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         )
 
         spec_sequence_masks_cpu: torch.Tensor | None = None
+        spec_request_indices: torch.Tensor | None = None
         if not self.use_spec_decode or num_decode_draft_tokens_cpu is None:
             spec_sequence_masks = None
             num_spec_decodes = 0
@@ -246,6 +257,13 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 spec_sequence_masks = async_tensor_h2d(
                     spec_sequence_masks_cpu, device=query_start_loc.device
                 )
+                if self.use_exact_spec_state_commit:
+                    spec_request_indices = async_tensor_h2d(
+                        torch.nonzero(spec_sequence_masks_cpu, as_tuple=False)
+                        .flatten()
+                        .to(torch.int32),
+                        device=query_start_loc.device,
+                    )
 
         if spec_sequence_masks is None:
             num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
@@ -427,6 +445,17 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         # metadata below is indexed by request.
         batch_size = m.num_reqs
 
+        if self.use_exact_spec_state_commit:
+            assert self.spec_request_indices is not None
+            if spec_request_indices is None:
+                self.spec_request_indices[:batch_size].fill_(-1)
+            else:
+                self.spec_request_indices[:num_spec_decodes].copy_(
+                    spec_request_indices, non_blocking=True
+                )
+                self.spec_request_indices[num_spec_decodes:batch_size].fill_(-1)
+            spec_request_indices = self.spec_request_indices[:batch_size]
+
         if (
             self.use_full_cuda_graph
             and num_prefills == 0
@@ -515,6 +544,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             spec_sequence_masks=spec_sequence_masks,
             spec_token_indx=spec_token_indx,
             non_spec_token_indx=non_spec_token_indx,
+            spec_request_indices=spec_request_indices,
             num_accepted_tokens=num_accepted_tokens,
             nums_dict=nums_dict,
             batch_ptr=batch_ptr,

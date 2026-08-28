@@ -169,6 +169,15 @@ def _build(
     return builder.build(common_prefix_len=0, common_attn_metadata=common, **kwargs)
 
 
+def _enable_exact_state_mapping(builder: GDNAttentionMetadataBuilder) -> None:
+    builder.use_exact_spec_state_commit = True
+    builder.spec_request_indices = torch.empty(
+        builder.vllm_config.scheduler_config.max_num_seqs,
+        dtype=torch.int32,
+        device=DEVICE,
+    )
+
+
 @pytest.mark.parametrize(
     "test_case", GDN_BUILD_TEST_CASES.values(), ids=GDN_BUILD_TEST_CASES.keys()
 )
@@ -221,3 +230,54 @@ def test_full_cudagraph_spec_metadata_uses_request_count():
     assert meta.spec_query_start_loc.shape == (batch.batch_size + 1,)
     assert meta.num_accepted_tokens is not None
     assert meta.num_accepted_tokens.shape == (batch.batch_size,)
+
+
+@pytest.mark.parametrize("num_speculative_tokens", [1, 3])
+def test_exact_state_mapping_tracks_compacted_spec_rows(
+    num_speculative_tokens: int,
+):
+    builder = _create_gdn_builder(num_speculative_tokens=num_speculative_tokens)
+    _enable_exact_state_mapping(builder)
+    spec_len = num_speculative_tokens + 1
+    batch = BatchSpec(
+        seq_lens=[64, 80, 96],
+        query_lens=[1, spec_len, spec_len],
+    )
+    meta = _build(
+        builder,
+        batch,
+        num_decode_draft_tokens=[-1, num_speculative_tokens, num_speculative_tokens],
+    )
+
+    assert meta.spec_request_indices is not None
+    assert meta.spec_request_indices.tolist() == [1, 2, -1]
+
+
+def test_exact_state_mapping_ignores_draftless_rows():
+    builder = _create_gdn_builder(num_speculative_tokens=3)
+    _enable_exact_state_mapping(builder)
+    batch = BatchSpec(seq_lens=[64, 80], query_lens=[1, 1])
+    meta = _build(builder, batch, num_decode_draft_tokens=[0, 0])
+
+    assert meta.num_spec_decodes == 0
+    assert meta.spec_request_indices is not None
+    assert meta.spec_request_indices.tolist() == [-1, -1]
+
+
+def test_exact_state_mapping_uses_stable_full_graph_buffer():
+    builder = _create_gdn_builder(
+        num_speculative_tokens=3,
+        full_cuda_graph=True,
+    )
+    _enable_exact_state_mapping(builder)
+    batch = BatchSpec(seq_lens=[80, 96], query_lens=[4, 4])
+
+    first = _build(builder, batch, num_decode_draft_tokens=[3, 3])
+    assert first.spec_request_indices is not None
+    first_pointer = first.spec_request_indices.data_ptr()
+    assert first.spec_request_indices.tolist() == [0, 1]
+
+    second = _build(builder, batch, num_decode_draft_tokens=[-1, 3])
+    assert second.spec_request_indices is not None
+    assert second.spec_request_indices.data_ptr() == first_pointer
+    assert second.spec_request_indices.tolist() == [1, -1]

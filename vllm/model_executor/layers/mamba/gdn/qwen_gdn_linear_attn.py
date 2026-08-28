@@ -38,6 +38,10 @@ from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
     causal_conv1d_fn,
     causal_conv1d_update,
 )
+from vllm.model_executor.layers.mamba.ops.gdn_exact_spec_state import (
+    commit_gdn_exact_spec_state,
+    gdn_exact_spec_verify,
+)
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.quantization.auto_awq import AutoAWQConfig
 from vllm.model_executor.layers.quantization.auto_gptq import AutoGPTQConfig
@@ -489,6 +493,78 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         self.enable_packed_recurrent_decode = (
             envs.VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE
         )
+        self.use_exact_spec_state_commit = envs.VLLM_ENABLE_GDN_EXACT_SPEC_STATE_COMMIT
+        self._exact_spec_state_indices: torch.Tensor | None = None
+        self._exact_spec_request_indices: torch.Tensor | None = None
+        self._exact_spec_num_rows = 0
+        if self.use_exact_spec_state_commit:
+            self._validate_exact_spec_state_commit(vllm_config, config)
+            max_spec_len = self.num_spec + 1
+            scheduler_config = vllm_config.scheduler_config
+            # A speculative row contains one target token and at least one
+            # draft token. Draft-less rows stay on the baseline path.
+            max_num_reqs = min(
+                scheduler_config.max_num_seqs,
+                scheduler_config.max_num_batched_tokens // 2,
+            )
+            if max_num_reqs < 1:
+                raise ValueError(
+                    "exact GDN state commit requires room for one speculative row"
+                )
+            activation_dtype = self.model_config.dtype
+            device = current_platform.current_device()
+            self.register_buffer(
+                "_exact_spec_scratch_a",
+                torch.empty(
+                    max_num_reqs,
+                    max_spec_len,
+                    self.num_v_heads // self.tp_size,
+                    dtype=activation_dtype,
+                    device=device,
+                ),
+                persistent=False,
+            )
+            self.register_buffer(
+                "_exact_spec_scratch_b",
+                torch.empty_like(self._exact_spec_scratch_a),
+                persistent=False,
+            )
+            self.register_buffer(
+                "_exact_spec_scratch_k",
+                torch.empty(
+                    max_num_reqs,
+                    max_spec_len,
+                    self.num_k_heads // self.tp_size,
+                    self.head_k_dim,
+                    dtype=activation_dtype,
+                    device=device,
+                ),
+                persistent=False,
+            )
+            self.register_buffer(
+                "_exact_spec_scratch_v",
+                torch.empty(
+                    max_num_reqs,
+                    max_spec_len,
+                    self.num_v_heads // self.tp_size,
+                    self.head_v_dim,
+                    dtype=activation_dtype,
+                    device=device,
+                ),
+                persistent=False,
+            )
+            self.register_buffer(
+                "_exact_spec_source_state_indices",
+                torch.empty(max_num_reqs, dtype=torch.int32, device=device),
+                persistent=False,
+            )
+            logger.info_once(
+                "Enabled exact GDN accepted-state commit: max_reqs=%d, "
+                "window=%d, scratch_bytes_per_layer=%d",
+                max_num_reqs,
+                max_spec_len,
+                self.get_exact_spec_state_scratch_bytes(),
+            )
         self.gdn_decode_kernel = envs.VLLM_GDN_DECODE_KERNEL.strip().lower()
         if self.gdn_decode_kernel == "cuda":
             reason = self._fused_gdn_decode_unsupported_reason(vllm_config)
@@ -508,6 +584,85 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         if prefix in compilation_config.static_forward_context:
             raise ValueError(f"Duplicate layer name: {prefix}")
         compilation_config.static_forward_context[prefix] = self
+
+    def _validate_exact_spec_state_commit(
+        self, vllm_config: VllmConfig, config: Qwen3NextConfig
+    ) -> None:
+        speculative_config = self.speculative_config
+        draft_model_config = (
+            speculative_config.draft_model_config
+            if speculative_config is not None
+            else None
+        )
+        if config.model_type != "qwen3_5_text":
+            raise ValueError("exact GDN state commit only supports Qwen3.5 text")
+        if (
+            speculative_config is None
+            or speculative_config.method != "mtp"
+            or draft_model_config is None
+            or draft_model_config.hf_config.model_type != "qwen3_5_mtp"
+        ):
+            raise ValueError("exact GDN state commit requires Qwen3.5 MTP")
+        if self.num_spec < 1 or self.num_spec > 3:
+            raise ValueError("exact GDN state commit supports static MTP K1-K3 only")
+        if speculative_config.uses_dynamic_speculative_decoding():
+            raise ValueError("exact GDN state commit requires static speculative K")
+        if self.cache_config.mamba_cache_mode != "align":
+            raise ValueError("exact GDN state commit requires mamba_cache_mode=align")
+        if self.model_config.dtype != torch.bfloat16:
+            raise ValueError("exact GDN state commit requires BF16 activations")
+        if self.get_state_dtype()[1] != torch.float16:
+            raise ValueError("exact GDN state commit requires configured FP16 state")
+        if vllm_config.mamba_config.enable_stochastic_rounding:
+            raise ValueError("exact GDN state commit rejects stochastic rounding")
+        if vllm_config.scheduler_config.async_scheduling:
+            raise ValueError("exact GDN state commit does not support async scheduling")
+        if (
+            vllm_config.parallel_config.tensor_parallel_size != 1
+            or vllm_config.parallel_config.pipeline_parallel_size != 1
+        ):
+            raise ValueError("exact GDN state commit is restricted to TP1 and PP1")
+        kv_transfer_config = vllm_config.kv_transfer_config
+        if (
+            kv_transfer_config is not None
+            and kv_transfer_config.kv_connector is not None
+        ):
+            raise ValueError("exact GDN state commit does not support KV connectors")
+
+    def commit_exact_spec_state(self, current_num_accepted: torch.Tensor) -> None:
+        """Commit the accepted state before align-mode state migration."""
+        if not self.use_exact_spec_state_commit:
+            return
+        assert self._exact_spec_state_indices is not None
+        assert self._exact_spec_request_indices is not None
+        commit_gdn_exact_spec_state(
+            A_log=self.A_log,
+            dt_bias=self.dt_bias,
+            scratch_a=self._exact_spec_scratch_a,
+            scratch_b=self._exact_spec_scratch_b,
+            scratch_k=self._exact_spec_scratch_k,
+            scratch_v=self._exact_spec_scratch_v,
+            state=self.kv_cache[1],
+            source_state_indices=self._exact_spec_source_state_indices,
+            destination_state_indices=self._exact_spec_state_indices,
+            spec_request_indices=self._exact_spec_request_indices,
+            current_num_accepted=current_num_accepted,
+            num_rows=self._exact_spec_num_rows,
+        )
+
+    def get_exact_spec_state_scratch_bytes(self) -> int:
+        if not self.use_exact_spec_state_commit:
+            return 0
+        return sum(
+            tensor.numel() * tensor.element_size()
+            for tensor in (
+                self._exact_spec_scratch_a,
+                self._exact_spec_scratch_b,
+                self._exact_spec_scratch_k,
+                self._exact_spec_scratch_v,
+                self._exact_spec_source_state_indices,
+            )
+        )
 
     def _fused_gdn_decode_unsupported_reason(
         self, vllm_config: VllmConfig
@@ -1443,8 +1598,15 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
 
         # 2.1: Process the multi-query part
         if spec_sequence_masks is not None:
-            core_attn_out_spec, last_recurrent_state = (
-                fused_sigmoid_gating_delta_rule_update(
+            if self.use_exact_spec_state_commit:
+                assert spec_query_start_loc is not None
+                assert spec_state_indices_tensor is not None
+                assert num_accepted_tokens is not None
+                assert attn_metadata.spec_request_indices is not None
+                self._exact_spec_state_indices = spec_state_indices_tensor
+                self._exact_spec_request_indices = attn_metadata.spec_request_indices
+                self._exact_spec_num_rows = attn_metadata.num_spec_decodes
+                core_attn_out_spec = gdn_exact_spec_verify(
                     A_log=self.A_log,
                     a=a_spec,
                     b=b_spec,
@@ -1452,17 +1614,41 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                     q=query_spec,
                     k=key_spec,
                     v=value_spec,
-                    initial_state=ssm_state,
-                    inplace_final_state=True,
+                    state=ssm_state,
                     cu_seqlens=spec_query_start_loc[  # type: ignore[index]
                         : attn_metadata.num_spec_decodes
                         + 1  # type: ignore[attr-defined]
                     ],
-                    ssm_state_indices=spec_state_indices_tensor,
-                    num_accepted_tokens=num_accepted_tokens,
-                    use_qk_l2norm_in_kernel=True,
+                    state_indices=spec_state_indices_tensor,
+                    previous_num_accepted=num_accepted_tokens,
+                    scratch_a=self._exact_spec_scratch_a,
+                    scratch_b=self._exact_spec_scratch_b,
+                    scratch_k=self._exact_spec_scratch_k,
+                    scratch_v=self._exact_spec_scratch_v,
+                    source_state_indices=self._exact_spec_source_state_indices,
                 )
-            )
+                last_recurrent_state = ssm_state
+            else:
+                core_attn_out_spec, last_recurrent_state = (
+                    fused_sigmoid_gating_delta_rule_update(
+                        A_log=self.A_log,
+                        a=a_spec,
+                        b=b_spec,
+                        dt_bias=self.dt_bias,
+                        q=query_spec,
+                        k=key_spec,
+                        v=value_spec,
+                        initial_state=ssm_state,
+                        inplace_final_state=True,
+                        cu_seqlens=spec_query_start_loc[  # type: ignore[index]
+                            : attn_metadata.num_spec_decodes
+                            + 1  # type: ignore[attr-defined]
+                        ],
+                        ssm_state_indices=spec_state_indices_tensor,
+                        num_accepted_tokens=num_accepted_tokens,
+                        use_qk_l2norm_in_kernel=True,
+                    )
+                )
         else:
             core_attn_out_spec, last_recurrent_state = None, None
 
