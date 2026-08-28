@@ -43,6 +43,22 @@ def test_api_key_is_not_compile_factor(monkeypatch: pytest.MonkeyPatch):
     assert "VLLM_API_KEY" not in envs.compile_factors()
 
 
+def test_engine_progress_watchdog_envs_are_not_compile_factors(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("VLLM_ENGINE_PROGRESS_WATCHDOG", "1")
+    monkeypatch.setenv("VLLM_ENGINE_PROGRESS_TIMEOUT_S", "120")
+    monkeypatch.setenv("VLLM_ENGINE_PROGRESS_CHECK_INTERVAL_S", "5")
+
+    assert environment_variables["VLLM_ENGINE_PROGRESS_WATCHDOG"]() is True
+    assert environment_variables["VLLM_ENGINE_PROGRESS_TIMEOUT_S"]() == 120.0
+    assert environment_variables["VLLM_ENGINE_PROGRESS_CHECK_INTERVAL_S"]() == 5.0
+    factors = envs.compile_factors()
+    assert "VLLM_ENGINE_PROGRESS_WATCHDOG" not in factors
+    assert "VLLM_ENGINE_PROGRESS_TIMEOUT_S" not in factors
+    assert "VLLM_ENGINE_PROGRESS_CHECK_INTERVAL_S" not in factors
+
+
 def test_p2p_side_channel_defaults_and_override(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.delenv("VLLM_P2P_SIDE_CHANNEL_HOST", raising=False)
     monkeypatch.delenv("VLLM_P2P_SIDE_CHANNEL_PORT", raising=False)

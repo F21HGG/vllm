@@ -24,6 +24,9 @@ if TYPE_CHECKING:
     LOCAL_RANK: int = 0
     CUDA_VISIBLE_DEVICES: str | None = None
     VLLM_ENGINE_ITERATION_TIMEOUT_S: int = 60
+    VLLM_ENGINE_PROGRESS_WATCHDOG: bool = False
+    VLLM_ENGINE_PROGRESS_TIMEOUT_S: float = 60.0
+    VLLM_ENGINE_PROGRESS_CHECK_INTERVAL_S: float = 10.0
     VLLM_ENGINE_READY_TIMEOUT_S: int = 600
     VLLM_API_KEY: str | None = None
     VLLM_DEBUG_LOG_API_SERVER_RESPONSE: bool = False
@@ -789,6 +792,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # timeout for each iteration in the engine
     "VLLM_ENGINE_ITERATION_TIMEOUT_S": lambda: int(
         os.environ.get("VLLM_ENGINE_ITERATION_TIMEOUT_S", "60")
+    ),
+    # Terminate the API server when requests are active but EngineCore stops
+    # producing outputs. Disabled by default.
+    "VLLM_ENGINE_PROGRESS_WATCHDOG": lambda: bool(
+        int(os.environ.get("VLLM_ENGINE_PROGRESS_WATCHDOG", "0"))
+    ),
+    "VLLM_ENGINE_PROGRESS_TIMEOUT_S": lambda: float(
+        os.environ.get("VLLM_ENGINE_PROGRESS_TIMEOUT_S", "60")
+    ),
+    "VLLM_ENGINE_PROGRESS_CHECK_INTERVAL_S": lambda: float(
+        os.environ.get("VLLM_ENGINE_PROGRESS_CHECK_INTERVAL_S", "10")
     ),
     # Timeout in seconds for waiting for engine cores to become ready
     # during startup. Default is 600 seconds (10 minutes).
@@ -2292,6 +2306,9 @@ def compile_factors() -> dict[str, object]:
         "VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR",
         "VLLM_FLASHINFER_AUTOTUNE_SKIP_OPS",
         "VLLM_ENGINE_ITERATION_TIMEOUT_S",
+        "VLLM_ENGINE_PROGRESS_WATCHDOG",
+        "VLLM_ENGINE_PROGRESS_TIMEOUT_S",
+        "VLLM_ENGINE_PROGRESS_CHECK_INTERVAL_S",
         "VLLM_HTTP_TIMEOUT_KEEP_ALIVE",
         "VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS",
         "VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS",

@@ -2,10 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import asyncio
 import os
+import signal
 import socket
 import time
 import warnings
-from collections.abc import AsyncGenerator, Iterable, Mapping
+from collections.abc import AsyncGenerator, Callable, Iterable, Mapping
 from copy import copy
 from typing import Any
 
@@ -55,6 +56,108 @@ from vllm.v1.metrics.prometheus import shutdown_prometheus
 from vllm.v1.metrics.stats import IterationStats
 
 logger = init_logger(__name__)
+
+
+class _EngineProgressState:
+    def __init__(self) -> None:
+        self.last_progress_at = time.monotonic()
+        self.active = False
+        self.suspended = False
+        self.timed_out = False
+
+    def record_request_started(self) -> None:
+        # Additional arrivals must not extend a stalled engine's deadline.
+        if not self.active:
+            self.last_progress_at = time.monotonic()
+            self.active = True
+
+    def record_engine_output(self, active: bool) -> None:
+        self.last_progress_at = time.monotonic()
+        self.active = active
+
+    def record_inactive(self) -> None:
+        self.active = False
+
+    def suspend(self) -> None:
+        self.suspended = True
+
+    def resume(self, active: bool) -> None:
+        self.suspended = False
+        self.active = active
+        if active:
+            self.last_progress_at = time.monotonic()
+
+
+def _get_engine_progress_watchdog_config(
+    *, local_engine_count: int = 1, enable_elastic_ep: bool = False
+) -> tuple[float, float] | None:
+    if not envs.VLLM_ENGINE_PROGRESS_WATCHDOG:
+        return None
+
+    if local_engine_count != 1:
+        raise ValueError(
+            "The EngineCore progress watchdog requires exactly one local "
+            f"EngineCore per API server, but found {local_engine_count}."
+        )
+    if enable_elastic_ep:
+        raise ValueError(
+            "The EngineCore progress watchdog does not support elastic EP."
+        )
+
+    check_interval_s = envs.VLLM_ENGINE_PROGRESS_CHECK_INTERVAL_S
+    timeout_s = envs.VLLM_ENGINE_PROGRESS_TIMEOUT_S
+    if check_interval_s <= 0:
+        raise ValueError("VLLM_ENGINE_PROGRESS_CHECK_INTERVAL_S must be positive.")
+    if timeout_s <= check_interval_s:
+        raise ValueError(
+            "VLLM_ENGINE_PROGRESS_TIMEOUT_S must be greater than "
+            "VLLM_ENGINE_PROGRESS_CHECK_INTERVAL_S."
+        )
+    return check_interval_s, timeout_s
+
+
+def _terminate_process() -> None:
+    os.kill(os.getpid(), signal.SIGTERM)
+
+
+async def _run_engine_progress_watchdog(
+    output_processor: OutputProcessor,
+    progress_state: _EngineProgressState,
+    *,
+    check_interval_s: float,
+    timeout_s: float,
+    terminate_process: Callable[[], None] = _terminate_process,
+) -> None:
+    while True:
+        await asyncio.sleep(check_interval_s)
+        if progress_state.suspended:
+            continue
+        if not output_processor.has_unfinished_requests():
+            progress_state.record_inactive()
+            continue
+        if not progress_state.active:
+            progress_state.record_request_started()
+            continue
+
+        stalled_for = time.monotonic() - progress_state.last_progress_at
+        if stalled_for < timeout_s:
+            continue
+
+        progress_state.timed_out = True
+        num_requests = output_processor.get_num_unfinished_requests()
+        logger.error(
+            "EngineCore made no progress for %.1f seconds while %d request(s) "
+            "were unfinished; terminating the API server for recovery.",
+            stalled_for,
+            num_requests,
+        )
+        try:
+            output_processor.propagate_error(EngineDeadError())
+        except Exception:
+            logger.exception("Failed to propagate EngineCore watchdog timeout.")
+        finally:
+            terminate_process()
+        return
 
 
 class InputStreamError(Exception):
@@ -171,6 +274,24 @@ class AsyncLLM(EngineClient):
         self._client_count = client_count
 
         self.output_handler: asyncio.Task | None = None
+        self.progress_watchdog: asyncio.Task | None = None
+        self._progress_watchdog_config = _get_engine_progress_watchdog_config(
+            local_engine_count=(vllm_config.parallel_config.data_parallel_size_local),
+            enable_elastic_ep=vllm_config.parallel_config.enable_elastic_ep,
+        )
+        self._engine_progress_state = (
+            _EngineProgressState()
+            if self._progress_watchdog_config is not None
+            else None
+        )
+        if self._progress_watchdog_config is not None:
+            check_interval_s, timeout_s = self._progress_watchdog_config
+            logger.info(
+                "EngineCore progress watchdog enabled: checking every %.1fs, "
+                "terminating after %.1fs without output while requests are active.",
+                check_interval_s,
+                timeout_s,
+            )
         try:
             # Start output handler eagerly if we are in the asyncio eventloop.
             asyncio.get_running_loop()
@@ -272,6 +393,10 @@ class AsyncLLM(EngineClient):
         handler = getattr(self, "output_handler", None)
         if handler is not None:
             cancel_task_threadsafe(handler)
+
+        watchdog = getattr(self, "progress_watchdog", None)
+        if watchdog is not None:
+            cancel_task_threadsafe(watchdog)
 
     async def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         if not hasattr(self, "_supported_tasks"):
@@ -432,6 +557,8 @@ class AsyncLLM(EngineClient):
     ):
         # Add the request to OutputProcessor (this process).
         self.output_processor.add_request(request, prompt, parent_req, index, queue)
+        if self._engine_progress_state is not None:
+            self._engine_progress_state.record_request_started()
 
         # Add the EngineCoreRequest to EngineCore (separate process).
         await self.engine_core.add_request_async(request)
@@ -683,6 +810,8 @@ class AsyncLLM(EngineClient):
         # P0 multi-modal sender ("shadow") cache; None for text-only models.
         mm_processor_cache = renderer.mm_processor_cache
         chunk_size = envs.VLLM_V1_OUTPUT_PROC_CHUNK_SIZE
+        progress_state = self._engine_progress_state
+        watchdog_config = self._progress_watchdog_config
 
         async def output_handler():
             try:
@@ -690,6 +819,10 @@ class AsyncLLM(EngineClient):
                     # 1) Pull EngineCoreOutputs from the EngineCore.
                     outputs = await engine_core.get_output_async()
                     num_outputs = len(outputs.outputs)
+                    if progress_state is not None:
+                        progress_state.record_engine_output(
+                            output_processor.has_unfinished_requests()
+                        )
 
                     iteration_stats = (
                         IterationStats() if (log_stats and num_outputs) else None
@@ -746,6 +879,17 @@ class AsyncLLM(EngineClient):
                 output_processor.propagate_error(e)
 
         self.output_handler = asyncio.create_task(output_handler())
+        if progress_state is not None:
+            assert watchdog_config is not None
+            check_interval_s, timeout_s = watchdog_config
+            self.progress_watchdog = asyncio.create_task(
+                _run_engine_progress_watchdog(
+                    output_processor,
+                    progress_state,
+                    check_interval_s=check_interval_s,
+                    timeout_s=timeout_s,
+                )
+            )
 
     async def abort(
         self, request_id: str | Iterable[str], internal: bool = False
@@ -757,6 +901,11 @@ class AsyncLLM(EngineClient):
         )
         all_request_ids = self.output_processor.abort_requests(request_ids, internal)
         await self.engine_core.abort_requests_async(all_request_ids)
+        if (
+            self._engine_progress_state is not None
+            and not self.output_processor.has_unfinished_requests()
+        ):
+            self._engine_progress_state.record_inactive()
 
         if self.log_requests:
             logger.info("Aborted request(s) %s.", ",".join(request_ids))
@@ -822,20 +971,30 @@ class AsyncLLM(EngineClient):
                 stacklevel=2,
             )
             mode = "wait"
-        if clear_cache:
-            await self.renderer.clear_mm_cache_async()
-        await self.engine_core.pause_scheduler_async(mode=mode, clear_cache=clear_cache)
-        # Small sleep to help ensure that final outputs from any in-flight requests are
-        # returned prior to this method returning. These outputs come out of the engine
-        # prior to the wait-for-idle completion event, but involve additional async
-        # tasks in output processing.
-        # Note that this is not required for correctness, just more intuitive ordering
-        # of events from caller's pov.
-        await asyncio.sleep(0.02)
+        progress_state = self._engine_progress_state
+        if progress_state is not None:
+            progress_state.suspend()
+        try:
+            if clear_cache:
+                await self.renderer.clear_mm_cache_async()
+            await self.engine_core.pause_scheduler_async(
+                mode=mode, clear_cache=clear_cache
+            )
+            # Small sleep to help ensure that final outputs from any in-flight
+            # requests are returned prior to this method returning.
+            await asyncio.sleep(0.02)
+        except BaseException:
+            if progress_state is not None:
+                progress_state.resume(self.output_processor.has_unfinished_requests())
+            raise
 
     async def resume_generation(self) -> None:
         """Resume generation after :meth:`pause_generation`."""
         await self.engine_core.resume_scheduler_async()
+        if self._engine_progress_state is not None:
+            self._engine_progress_state.resume(
+                self.output_processor.has_unfinished_requests()
+            )
 
     async def is_paused(self) -> bool:
         """Return whether the engine is currently paused."""
@@ -970,15 +1129,27 @@ class AsyncLLM(EngineClient):
         await self.engine_core.reset_encoder_cache_async()
 
     async def sleep(self, level: int = 1, mode: PauseMode = "abort") -> None:
-        if level >= 1:
-            await self.renderer.clear_mm_cache_async()
-        await self.engine_core.sleep_async(level, mode)
+        progress_state = self._engine_progress_state
+        if progress_state is not None:
+            progress_state.suspend()
+        try:
+            if level >= 1:
+                await self.renderer.clear_mm_cache_async()
+            await self.engine_core.sleep_async(level, mode)
+        except BaseException:
+            if progress_state is not None:
+                progress_state.resume(self.output_processor.has_unfinished_requests())
+            raise
 
         if self.logger_manager is not None:
             self.logger_manager.record_sleep_state(1, level)
 
     async def wake_up(self, tags: list[str] | None = None) -> None:
         await self.engine_core.wake_up_async(tags)
+        if self._engine_progress_state is not None:
+            self._engine_progress_state.resume(
+                self.output_processor.has_unfinished_requests()
+            )
 
         if self.logger_manager is not None:
             self.logger_manager.record_sleep_state(0, 0)
@@ -1106,7 +1277,10 @@ class AsyncLLM(EngineClient):
     @property
     def is_running(self) -> bool:
         # Is None before the loop is started.
-        return self.output_handler is None or not self.output_handler.done()
+        handler_running = self.output_handler is None or not self.output_handler.done()
+        progress_state = getattr(self, "_engine_progress_state", None)
+        progress_timed_out = progress_state is not None and progress_state.timed_out
+        return handler_running and not progress_timed_out
 
     @property
     def is_stopped(self) -> bool:
